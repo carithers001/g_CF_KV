@@ -35,7 +35,10 @@ const CLOUDFLARE_API_OPERATIONS = Object.freeze({
   READ_METADATA: "read_metadata",
   CHECK_EXISTING_VALUE: "check_existing_value",
   CHECK_EXISTING_METADATA: "check_existing_metadata",
+  CHECK_CREATE_VALUE: "check_create_value",
   WRITE_VALUE: "write_value",
+  CREATE_VALUE: "create_value",
+  DELETE_VALUE: "delete_value",
 });
 
 const encoder = new TextEncoder();
@@ -116,12 +119,28 @@ async function handleApiRequest(request, env, url) {
       return await writeValue(request, config);
     }
 
+    if (pathname === "/api/value" && request.method === "POST") {
+      assertSameOrigin(request);
+      const config = getConfiguration(env);
+      await requireSession(request, config);
+      return await createValue(request, config);
+    }
+
+    if (pathname === "/api/value" && request.method === "DELETE") {
+      assertSameOrigin(request);
+      const config = getConfiguration(env);
+      await requireSession(request, config);
+      return await deleteValue(request, config);
+    }
+
     if (
       pathname === "/api/namespaces" ||
       pathname === "/api/keys" ||
       pathname === "/api/value"
     ) {
-      return methodNotAllowed(pathname === "/api/value" ? ["GET", "PUT"] : ["GET"]);
+      return methodNotAllowed(
+        pathname === "/api/value" ? ["GET", "POST", "PUT", "DELETE"] : ["GET"],
+      );
     }
 
     return notFoundResponse();
@@ -272,20 +291,7 @@ async function writeValue(request, config) {
   const body = await readJsonBody(request);
   const namespaceId = readNamespaceId(body.namespaceId, config);
   const key = readKey(body.key);
-  const value = typeof body.value === "string" ? body.value : null;
-
-  if (value === null) {
-    throw new HttpError(400, "值必须是文本。");
-  }
-  if (hasUnpairedSurrogate(value)) {
-    throw new HttpError(400, "值包含无效的 Unicode 代理项，不能安全保存。");
-  }
-  if (byteLength(value) > MAX_EDITABLE_VALUE_BYTES) {
-    throw new HttpError(
-      413,
-      `编辑器只允许保存不超过 ${MAX_EDITABLE_VALUE_BYTES / 1024 / 1024} MiB 的 UTF-8 文本。`,
-    );
-  }
+  const value = readEditableTextValue(body.value);
 
   // The Cloudflare PUT API clears metadata and expiration when they are omitted.
   // Re-read them immediately before saving instead of trusting stale browser state.
@@ -307,20 +313,7 @@ async function writeValue(request, config) {
       "该键将在 60 秒内过期，不能在不改变过期策略的情况下安全保存。",
     );
   }
-  // A string FormData field can normalize line endings. A Blob is an Uploadable
-  // value part, so its UTF-8 bytes are sent exactly as encoded here.
-  const formData = new FormData();
-  formData.set(
-    "value",
-    new Blob([encoder.encode(value)], { type: "text/plain;charset=utf-8" }),
-    "value",
-  );
-  if (
-    existingAttributes.metadata !== undefined &&
-    existingAttributes.metadata !== null
-  ) {
-    formData.set("metadata", JSON.stringify(existingAttributes.metadata));
-  }
+  const formData = valueFormData(value, existingAttributes.metadata);
 
   const endpoint = new URL(
     `${CLOUDFLARE_API_BASE}${namespacePath(config, namespaceId)}/values/${encodeKeyPathSegment(key)}`,
@@ -342,6 +335,105 @@ async function writeValue(request, config) {
       existingAttributes.metadata !== undefined &&
       existingAttributes.metadata !== null,
   });
+}
+
+async function createValue(request, config) {
+  const body = await readJsonBody(request);
+  const namespaceId = readNamespaceId(body.namespaceId, config);
+  const key = readKey(body.key);
+  const value = readEditableTextValue(body.value);
+
+  // The KV write API is an unconditional PUT. Check first so ordinary duplicate
+  // creation attempts fail instead of overwriting an existing key. This remains
+  // non-atomic: a concurrent creator can write between this read and the PUT.
+  if (await keyExists(config, namespaceId, key)) {
+    throw new HttpError(409, "键已存在，请在列表中选择该键后修改。");
+  }
+
+  const endpoint = `${namespacePath(config, namespaceId)}/values/${encodeKeyPathSegment(key)}`;
+  const response = await cloudflareFetch(
+    config,
+    CLOUDFLARE_API_OPERATIONS.CREATE_VALUE,
+    endpoint,
+    {
+      method: "PUT",
+      // New keys intentionally start without metadata or an expiration policy.
+      body: valueFormData(value),
+    },
+  );
+  await readCloudflareJson(response);
+
+  return jsonResponse({ created: true }, 201);
+}
+
+async function deleteValue(request, config) {
+  const body = await readJsonBody(request);
+  const namespaceId = readNamespaceId(body.namespaceId, config);
+  const key = readKey(body.key);
+
+  // The browser asks the user to type the full key name. Keep this check on the
+  // server too; client-side confirmation is not an authorization boundary.
+  if (body.confirmation !== key) {
+    throw new HttpError(400, "请输入完整键名以确认删除。");
+  }
+
+  const response = await cloudflareFetch(
+    config,
+    CLOUDFLARE_API_OPERATIONS.DELETE_VALUE,
+    `${namespacePath(config, namespaceId)}/values/${encodeKeyPathSegment(key)}`,
+    { method: "DELETE" },
+  );
+  await readCloudflareJson(response);
+
+  return jsonResponse({ deleted: true });
+}
+
+function readEditableTextValue(value) {
+  if (typeof value !== "string") {
+    throw new HttpError(400, "值必须是文本。");
+  }
+  if (hasUnpairedSurrogate(value)) {
+    throw new HttpError(400, "值包含无效的 Unicode 代理项，不能安全保存。");
+  }
+  if (byteLength(value) > MAX_EDITABLE_VALUE_BYTES) {
+    throw new HttpError(
+      413,
+      `编辑器只允许保存不超过 ${MAX_EDITABLE_VALUE_BYTES / 1024 / 1024} MiB 的 UTF-8 文本。`,
+    );
+  }
+  return value;
+}
+
+function valueFormData(value, metadata) {
+  // A string FormData field can normalize line endings. A Blob is an Uploadable
+  // value part, so its UTF-8 bytes are sent exactly as encoded here.
+  const formData = new FormData();
+  formData.set(
+    "value",
+    new Blob([encoder.encode(value)], { type: "text/plain;charset=utf-8" }),
+    "value",
+  );
+  if (metadata !== undefined && metadata !== null) {
+    formData.set("metadata", JSON.stringify(metadata));
+  }
+  return formData;
+}
+
+async function keyExists(config, namespaceId, key) {
+  const response = await cloudflareFetch(
+    config,
+    CLOUDFLARE_API_OPERATIONS.CHECK_CREATE_VALUE,
+    `${namespacePath(config, namespaceId)}/values/${encodeKeyPathSegment(key)}`,
+  );
+
+  if (response.status === 404) {
+    await discardResponseBody(response);
+    return false;
+  }
+
+  await ensureCloudflareSuccess(response);
+  await discardResponseBody(response);
+  return true;
 }
 
 async function readExistingAttributes(config, namespaceId, key) {
@@ -566,7 +658,7 @@ async function cloudflareFetch(config, operation, pathOrUrl, init = {}) {
     await discardResponseBody(response);
     if (method !== "GET") {
       logCloudflareRedirectRejected(operation, method, response.status, "non_get");
-      throw new HttpError(502, "Cloudflare API 写入请求发生重定向，未自动重试。");
+      throw new HttpError(502, "Cloudflare API 变更请求发生重定向，未自动重试。");
     }
     if (redirectCount === MAX_TRUSTED_CLOUDFLARE_API_REDIRECTS) {
       logCloudflareRedirectRejected(operation, method, response.status, "too_many_redirects");
@@ -653,7 +745,7 @@ function logCloudflareFetchFailure(operation, method, error) {
 }
 
 function diagnosticRequestMethod(method) {
-  if (method === "GET" || method === "PUT") {
+  if (method === "GET" || method === "POST" || method === "PUT" || method === "DELETE") {
     return method;
   }
   return "OTHER";
@@ -1148,7 +1240,7 @@ const APP_HTML = String.raw`<!doctype html>
         <header class="topbar">
           <div>
             <h1>Cloudflare KV 管理</h1>
-            <p class="muted">浏览、读取和保存一个受限账号中的 UTF-8 文本值。</p>
+            <p class="muted">浏览、读取、新建、修改和删除一个受限账号中的 UTF-8 文本值。</p>
           </div>
           <button id="logout-button" class="button secondary" type="button">退出登录</button>
         </header>
@@ -1168,6 +1260,7 @@ const APP_HTML = String.raw`<!doctype html>
           <section class="panel column" aria-labelledby="key-heading">
             <div class="column-header">
               <h2 id="key-heading">键</h2>
+              <button id="new-key-button" class="button" type="button" disabled>新建键</button>
             </div>
             <form id="key-filter-form" class="key-tools">
               <input id="key-prefix" type="search" placeholder="按键前缀筛选" aria-label="键前缀">
@@ -1191,9 +1284,10 @@ const APP_HTML = String.raw`<!doctype html>
               </label>
               <div class="actions">
                 <button id="save-button" class="button" type="button" disabled>保存</button>
+                <button id="delete-button" class="button danger" type="button" disabled>删除</button>
               </div>
               <p id="app-status" class="status" role="status" aria-live="polite"></p>
-              <p class="note">仅可修改已存在的键。保存前会重新读取 metadata 和过期时间，并尽力写回；该过程不是原子操作。KV 是最终一致的，并发保存仍可能由最后一次写入覆盖。统一的 LF、CRLF 或 CR 换行会保留；混合换行的值若被修改，编辑器会拒绝保存以防止静默改写。二进制值和大于 1 MiB 的文本不会在此编辑器中打开。</p>
+              <p class="note">可新建、修改和删除键；现有键名不可直接改名。新建键默认无 metadata 且永不过期；创建前会检查同名键，但该检查与写入不是原子操作，并发创建仍可能由最后一次写入覆盖。修改已有键前会重新读取 metadata 和过期时间，并尽力写回。删除需输入完整键名确认，且不可恢复。KV 是最终一致的，新建或删除后列表可能暂时未反映。统一的 LF、CRLF 或 CR 换行会保留；混合换行的值若被修改，编辑器会拒绝保存以防止静默改写。二进制值和大于 1 MiB 的文本不会在此编辑器中打开。</p>
             </div>
           </section>
         </div>
@@ -1212,16 +1306,17 @@ const APP_HTML = String.raw`<!doctype html>
           keys: [],
           nextKeyCursor: null,
           selectedKey: null,
+          editorMode: "idle",
           originalValue: "",
           originalEditorValue: "",
           lineEndingStyle: "lf",
-          saving: false,
+          mutating: false,
           authenticated: false,
           authRequestVersion: 0,
           namespaceRequestVersion: 0,
           keyRequestVersion: 0,
           valueRequestVersion: 0,
-          saveRequestVersion: 0
+          mutationRequestVersion: 0
         };
 
         var ui = {
@@ -1237,6 +1332,7 @@ const APP_HTML = String.raw`<!doctype html>
           namespaceFooter: document.getElementById("namespace-footer"),
           moreNamespaces: document.getElementById("more-namespaces"),
           keyHeading: document.getElementById("key-heading"),
+          newKeyButton: document.getElementById("new-key-button"),
           keyList: document.getElementById("key-list"),
           keyFilterForm: document.getElementById("key-filter-form"),
           keyPrefix: document.getElementById("key-prefix"),
@@ -1247,6 +1343,7 @@ const APP_HTML = String.raw`<!doctype html>
           keyInput: document.getElementById("key-input"),
           valueInput: document.getElementById("value-input"),
           saveButton: document.getElementById("save-button"),
+          deleteButton: document.getElementById("delete-button"),
           appStatus: document.getElementById("app-status")
         };
 
@@ -1288,8 +1385,12 @@ const APP_HTML = String.raw`<!doctype html>
         function invalidateSelectedNamespaceRequests() {
           state.keyRequestVersion += 1;
           state.valueRequestVersion += 1;
-          state.saveRequestVersion += 1;
-          state.saving = false;
+          invalidateMutations();
+        }
+
+        function invalidateMutations() {
+          state.mutationRequestVersion += 1;
+          state.mutating = false;
         }
 
         function clearWorkspace() {
@@ -1357,12 +1458,14 @@ const APP_HTML = String.raw`<!doctype html>
             ui.namespaceList.append(empty);
           } else {
             state.namespaces.forEach(function (namespace) {
-              ui.namespaceList.append(createListButton(
+              var namespaceButton = createListButton(
                 namespace.title,
                 namespace.id,
                 state.selectedNamespace && state.selectedNamespace.id === namespace.id,
                 function () { selectNamespace(namespace); }
-              ));
+              );
+              namespaceButton.disabled = state.mutating;
+              ui.namespaceList.append(namespaceButton);
             });
           }
           ui.namespaceFooter.classList.toggle("hidden", !state.nextNamespacePage);
@@ -1382,12 +1485,14 @@ const APP_HTML = String.raw`<!doctype html>
             ui.keyList.append(empty);
           } else {
             state.keys.forEach(function (key) {
-              ui.keyList.append(createListButton(
+              var keyButton = createListButton(
                 key.name,
                 formatExpiration(key.expiration),
                 state.selectedKey === key.name,
                 function () { openKey(key); }
-              ));
+              );
+              keyButton.disabled = state.mutating;
+              ui.keyList.append(keyButton);
             });
           }
           ui.keyFooter.classList.toggle("hidden", !state.nextKeyCursor);
@@ -1402,6 +1507,7 @@ const APP_HTML = String.raw`<!doctype html>
 
         function resetEditor() {
           state.selectedKey = null;
+          state.editorMode = "idle";
           state.originalValue = "";
           state.originalEditorValue = "";
           state.lineEndingStyle = "lf";
@@ -1410,9 +1516,30 @@ const APP_HTML = String.raw`<!doctype html>
           ui.editorMeta.classList.add("hidden");
           ui.keyInput.value = "";
           ui.valueInput.value = "";
-          ui.keyInput.disabled = true;
-          ui.valueInput.disabled = true;
-          ui.saveButton.disabled = true;
+          updateEditorControls();
+        }
+
+        function updateEditorControls() {
+          var editing = state.editorMode === "edit";
+          var creating = state.editorMode === "create";
+          var editorAvailable = !state.mutating && (editing || creating);
+          ui.newKeyButton.disabled =
+            !state.selectedNamespace || state.mutating || state.editorMode === "loading";
+          setListButtonsDisabled(ui.namespaceList, state.mutating);
+          setListButtonsDisabled(ui.keyList, state.mutating);
+          ui.keyInput.disabled = !editorAvailable || !creating;
+          ui.valueInput.disabled = !editorAvailable;
+          ui.saveButton.disabled = !editorAvailable;
+          ui.deleteButton.disabled = !editorAvailable || !editing || !state.selectedKey;
+          ui.saveButton.textContent = creating ? "创建" : "保存";
+        }
+
+        function setListButtonsDisabled(list, disabled) {
+          Array.prototype.forEach.call(list.children, function (child) {
+            if (child.type === "button") {
+              child.disabled = disabled;
+            }
+          });
         }
 
         function normalizeTextareaLineEndings(value) {
@@ -1510,6 +1637,9 @@ const APP_HTML = String.raw`<!doctype html>
             state.namespacePage = targetPage;
             state.nextNamespacePage = data.nextPage;
             renderNamespaces();
+            if (!state.mutating) {
+              setStatus(ui.appStatus, "", "");
+            }
           }).catch(function (error) {
             if (requestVersion === state.namespaceRequestVersion) {
               handleAppError(error);
@@ -1524,6 +1654,9 @@ const APP_HTML = String.raw`<!doctype html>
         }
 
         function selectNamespace(namespace) {
+          if (state.mutating) {
+            return;
+          }
           if (state.selectedNamespace && state.selectedNamespace.id === namespace.id) {
             return;
           }
@@ -1577,18 +1710,37 @@ const APP_HTML = String.raw`<!doctype html>
           });
         }
 
+        function startCreateKey() {
+          if (!state.selectedNamespace || state.mutating) {
+            return;
+          }
+          state.valueRequestVersion += 1;
+          invalidateMutations();
+          resetEditor();
+          state.editorMode = "create";
+          ui.editorHeading.textContent = "新建键";
+          setEditorMeta(null, false);
+          updateEditorControls();
+          ui.keyInput.focus();
+          setStatus(ui.appStatus, "新建键默认无 metadata 且永不过期。", "info");
+          renderKeys();
+        }
+
         function openKey(key) {
-          if (!state.selectedNamespace) {
+          if (!state.selectedNamespace || state.mutating) {
             return;
           }
           var namespaceId = state.selectedNamespace.id;
           var keyName = key.name;
           var requestVersion = state.valueRequestVersion + 1;
           state.valueRequestVersion = requestVersion;
-          state.saveRequestVersion += 1;
-          state.saving = false;
+          invalidateMutations();
+          resetEditor();
+          state.editorMode = "loading";
+          ui.editorHeading.textContent = "正在读取键值…";
+          updateEditorControls();
+          renderKeys();
           setStatus(ui.appStatus, "正在读取键值…", "info");
-          ui.saveButton.disabled = true;
           var params = new URLSearchParams({
             namespaceId: namespaceId,
             key: keyName
@@ -1604,14 +1756,13 @@ const APP_HTML = String.raw`<!doctype html>
               throw new Error("服务器返回了无效的文本值。");
             }
             state.selectedKey = keyName;
+            state.editorMode = "edit";
             ui.editorHeading.textContent = keyName;
             ui.keyInput.value = keyName;
-            ui.keyInput.disabled = true;
             rememberEditorValue(data.value);
             ui.valueInput.value = state.originalEditorValue;
-            ui.valueInput.disabled = false;
-            ui.saveButton.disabled = false;
             setEditorMeta(data.expiration, data.hasMetadata);
+            updateEditorControls();
             setStatus(ui.appStatus, "", "");
             renderKeys();
           }).catch(function (error) {
@@ -1627,63 +1778,147 @@ const APP_HTML = String.raw`<!doctype html>
         }
 
         function saveCurrentValue() {
-          if (!state.selectedNamespace || !state.selectedKey || state.saving) {
+          var creating = state.editorMode === "create";
+          var editing = state.editorMode === "edit";
+          if (!state.selectedNamespace || (!creating && !editing) || state.mutating) {
             return;
           }
           var namespaceId = state.selectedNamespace.id;
-          var key = state.selectedKey;
-          var preparedValue = valueForSave();
-          if (!preparedValue) {
+          var key = creating ? ui.keyInput.value : state.selectedKey;
+          if (!key) {
+            setStatus(ui.appStatus, "请输入键名。", "error");
+            ui.keyInput.focus();
             return;
           }
-          if (preparedValue.unchanged) {
-            setStatus(ui.appStatus, "未检测到修改，未执行保存。", "info");
-            return;
+
+          var value;
+          if (creating) {
+            // An empty string is a valid value for a newly created key.
+            value = ui.valueInput.value;
+          } else {
+            var preparedValue = valueForSave();
+            if (!preparedValue) {
+              return;
+            }
+            if (preparedValue.unchanged) {
+              setStatus(ui.appStatus, "未检测到修改，未执行保存。", "info");
+              return;
+            }
+            value = preparedValue.value;
           }
-          var value = preparedValue.value;
-          var requestVersion = state.saveRequestVersion + 1;
-          state.saveRequestVersion = requestVersion;
-          state.saving = true;
-          ui.saveButton.disabled = true;
-          ui.valueInput.disabled = true;
-          setStatus(ui.appStatus, "正在保存…", "info");
+
+          var requestVersion = state.mutationRequestVersion + 1;
+          state.mutationRequestVersion = requestVersion;
+          state.mutating = true;
+          updateEditorControls();
+          setStatus(ui.appStatus, creating ? "正在创建…" : "正在保存…", "info");
           api("/api/value", {
-            method: "PUT",
+            method: creating ? "POST" : "PUT",
             body: {
               namespaceId: namespaceId,
               key: key,
               value: value
             }
-          }).then(function (data) {
+          }).then(function () {
             if (
-              requestVersion !== state.saveRequestVersion ||
+              requestVersion !== state.mutationRequestVersion ||
               !isSelectedNamespace(namespaceId)
             ) {
               return;
             }
             state.selectedKey = key;
+            state.editorMode = "edit";
             rememberEditorValue(value);
-            ui.keyInput.disabled = true;
+            ui.keyInput.value = key;
             ui.editorHeading.textContent = key;
-            setStatus(ui.appStatus, "已保存。", "success");
+            if (creating) {
+              setEditorMeta(null, false);
+              setStatus(ui.appStatus, "已创建。KV 最终一致，键列表可能暂时未反映。", "success");
+            } else {
+              setStatus(ui.appStatus, "已保存。", "success");
+            }
+            renderKeys();
             loadKeys(false);
           }).catch(function (error) {
             if (
-              requestVersion === state.saveRequestVersion &&
+              requestVersion === state.mutationRequestVersion &&
               isSelectedNamespace(namespaceId)
             ) {
               handleAppError(error);
             }
           }).finally(function () {
             if (
-              requestVersion !== state.saveRequestVersion ||
+              requestVersion !== state.mutationRequestVersion ||
               !isSelectedNamespace(namespaceId)
             ) {
               return;
             }
-            state.saving = false;
-            ui.valueInput.disabled = false;
-            ui.saveButton.disabled = false;
+            state.mutating = false;
+            updateEditorControls();
+          });
+        }
+
+        function deleteCurrentValue() {
+          if (
+            !state.selectedNamespace ||
+            state.editorMode !== "edit" ||
+            !state.selectedKey ||
+            state.mutating
+          ) {
+            return;
+          }
+          var namespaceId = state.selectedNamespace.id;
+          var key = state.selectedKey;
+          var confirmation = prompt(
+            "删除后无法恢复。请输入下面的完整键名以确认删除：\n" + key
+          );
+          if (confirmation === null) {
+            return;
+          }
+          if (confirmation !== key) {
+            setStatus(ui.appStatus, "输入的键名不匹配，未执行删除。", "error");
+            return;
+          }
+
+          var requestVersion = state.mutationRequestVersion + 1;
+          state.mutationRequestVersion = requestVersion;
+          state.mutating = true;
+          updateEditorControls();
+          setStatus(ui.appStatus, "正在删除…", "info");
+          api("/api/value", {
+            method: "DELETE",
+            body: {
+              namespaceId: namespaceId,
+              key: key,
+              confirmation: confirmation
+            }
+          }).then(function () {
+            if (
+              requestVersion !== state.mutationRequestVersion ||
+              !isSelectedNamespace(namespaceId)
+            ) {
+              return;
+            }
+            resetEditor();
+            renderKeys();
+            setStatus(ui.appStatus, "已删除。KV 最终一致，键列表可能暂时未反映。", "success");
+            loadKeys(false);
+          }).catch(function (error) {
+            if (
+              requestVersion === state.mutationRequestVersion &&
+              isSelectedNamespace(namespaceId)
+            ) {
+              handleAppError(error);
+            }
+          }).finally(function () {
+            if (
+              requestVersion !== state.mutationRequestVersion ||
+              !isSelectedNamespace(namespaceId)
+            ) {
+              return;
+            }
+            state.mutating = false;
+            updateEditorControls();
           });
         }
 
@@ -1742,8 +1977,10 @@ const APP_HTML = String.raw`<!doctype html>
 
         ui.refreshNamespaces.addEventListener("click", function () { loadNamespaces(false); });
         ui.moreNamespaces.addEventListener("click", function () { loadNamespaces(true); });
+        ui.newKeyButton.addEventListener("click", startCreateKey);
         ui.moreKeys.addEventListener("click", function () { loadKeys(true); });
         ui.saveButton.addEventListener("click", saveCurrentValue);
+        ui.deleteButton.addEventListener("click", deleteCurrentValue);
         ui.keyFilterForm.addEventListener("submit", function (event) {
           event.preventDefault();
           loadKeys(false);
