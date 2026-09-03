@@ -477,7 +477,7 @@ function getConfiguration(env) {
   if (!isIdentifier(accountId)) {
     throw new HttpError(500, "服务器配置无效。");
   }
-  if (adminPassword.length < 12 || sessionSecret.length < 32) {
+  if (adminPassword.length < 2 || sessionSecret.length < 32) {
     throw new HttpError(500, "服务器配置无效。");
   }
 
