@@ -12,6 +12,10 @@
  */
 
 const CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4";
+const CLOUDFLARE_API_ORIGIN = "https://api.cloudflare.com";
+const CLOUDFLARE_API_PATH_PREFIX = "/client/v4/";
+const MAX_TRUSTED_CLOUDFLARE_API_REDIRECTS = 1;
+const CLOUDFLARE_REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 // `__Host-` prevents a sibling subdomain from setting a conflicting session cookie.
 const SESSION_COOKIE_NAME = "__Host-kv_manager_session";
 const SESSION_VERSION = 1;
@@ -535,12 +539,99 @@ async function cloudflareFetch(config, operation, pathOrUrl, init = {}) {
       : new URL(`${CLOUDFLARE_API_BASE}${pathOrUrl}`);
   const headers = new Headers(init.headers);
   headers.set("Authorization", `Bearer ${config.apiToken}`);
+  const method = normalizeRequestMethod(init.method);
+  let currentUrl = url;
+
+  for (
+    let redirectCount = 0;
+    redirectCount <= MAX_TRUSTED_CLOUDFLARE_API_REDIRECTS;
+    redirectCount += 1
+  ) {
+    let response;
+    try {
+      response = await fetch(currentUrl, {
+        ...init,
+        headers: new Headers(headers),
+        redirect: "manual",
+      });
+    } catch (error) {
+      logCloudflareFetchFailure(operation, method, error);
+      throw new HttpError(502, "无法连接 Cloudflare API。");
+    }
+
+    if (!isRedirectStatus(response.status)) {
+      return response;
+    }
+
+    await discardResponseBody(response);
+    if (method !== "GET") {
+      logCloudflareRedirectRejected(operation, method, response.status, "non_get");
+      throw new HttpError(502, "Cloudflare API 写入请求发生重定向，未自动重试。");
+    }
+    if (redirectCount === MAX_TRUSTED_CLOUDFLARE_API_REDIRECTS) {
+      logCloudflareRedirectRejected(operation, method, response.status, "too_many_redirects");
+      throw new HttpError(502, "Cloudflare API 重定向次数超出安全上限。");
+    }
+
+    const redirect = resolveTrustedCloudflareRedirect(
+      response.headers.get("location"),
+      currentUrl,
+      config.accountId,
+    );
+    if (!redirect.url) {
+      logCloudflareRedirectRejected(operation, method, response.status, redirect.targetClass);
+      throw new HttpError(502, "Cloudflare API 返回了不受信任的重定向。");
+    }
+    currentUrl = redirect.url;
+  }
+
+  throw new HttpError(502, "Cloudflare API 重定向次数超出安全上限。");
+}
+
+function normalizeRequestMethod(method) {
+  return typeof method === "string" ? method.toUpperCase() : "GET";
+}
+
+function isRedirectStatus(status) {
+  return CLOUDFLARE_REDIRECT_STATUSES.has(status);
+}
+
+function resolveTrustedCloudflareRedirect(location, currentUrl, accountId) {
+  if (!location) {
+    return { url: null, targetClass: "missing" };
+  }
 
   try {
-    return await fetch(url, { ...init, headers, redirect: "error" });
-  } catch (error) {
-    logCloudflareFetchFailure(operation, init.method, error);
-    throw new HttpError(502, "无法连接 Cloudflare API。");
+    const target = new URL(location, currentUrl);
+    const accountKvPathPrefix =
+      `${CLOUDFLARE_API_PATH_PREFIX}accounts/${accountId}/storage/kv/`;
+    const isTrusted =
+      target.origin === CLOUDFLARE_API_ORIGIN &&
+      target.username === "" &&
+      target.password === "" &&
+      target.pathname.startsWith(accountKvPathPrefix);
+    return isTrusted
+      ? { url: target, targetClass: "same_api_origin" }
+      : { url: null, targetClass: "other_or_invalid" };
+  } catch {
+    return { url: null, targetClass: "other_or_invalid" };
+  }
+}
+
+function logCloudflareRedirectRejected(operation, method, status, targetClass) {
+  const diagnostic = JSON.stringify({
+    event: "cloudflare_api_redirect_rejected",
+    operation,
+    method: diagnosticRequestMethod(method),
+    status,
+    target_class: targetClass,
+  });
+
+  try {
+    // Do not log the redirect Location, URL, headers, or any request configuration.
+    console.error(diagnostic);
+  } catch {
+    // Logging failure must not replace the original, generic 502 response.
   }
 }
 
@@ -548,7 +639,7 @@ function logCloudflareFetchFailure(operation, method, error) {
   const diagnostic = JSON.stringify({
     event: "cloudflare_api_fetch_rejected",
     operation,
-    method: method === "PUT" ? "PUT" : "GET",
+    method: diagnosticRequestMethod(method),
     error_category: cloudflareFetchErrorCategory(error),
   });
 
@@ -559,6 +650,13 @@ function logCloudflareFetchFailure(operation, method, error) {
   } catch {
     // Logging failure must not replace the original, generic 502 response.
   }
+}
+
+function diagnosticRequestMethod(method) {
+  if (method === "GET" || method === "PUT") {
+    return method;
+  }
+  return "OTHER";
 }
 
 function cloudflareFetchErrorCategory(error) {
