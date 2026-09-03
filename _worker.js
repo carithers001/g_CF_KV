@@ -24,6 +24,15 @@ const MINIMUM_PRESERVED_EXPIRATION_SECONDS = 60;
 const MAX_KEY_BYTES = 512;
 const NAMESPACE_PAGE_SIZE = 100;
 const KEY_PAGE_SIZE = 100;
+const CLOUDFLARE_API_OPERATIONS = Object.freeze({
+  LIST_NAMESPACES: "list_namespaces",
+  LIST_KEYS: "list_keys",
+  READ_VALUE: "read_value",
+  READ_METADATA: "read_metadata",
+  CHECK_EXISTING_VALUE: "check_existing_value",
+  CHECK_EXISTING_METADATA: "check_existing_metadata",
+  WRITE_VALUE: "write_value",
+});
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -164,6 +173,7 @@ async function listNamespaces(url, config) {
   });
   const response = await cloudflareFetch(
     config,
+    CLOUDFLARE_API_OPERATIONS.LIST_NAMESPACES,
     `/accounts/${config.accountId}/storage/kv/namespaces?${query.toString()}`,
   );
   const payload = await readCloudflareJson(response);
@@ -211,6 +221,7 @@ async function listKeys(url, config) {
 
   const response = await cloudflareFetch(
     config,
+    CLOUDFLARE_API_OPERATIONS.LIST_KEYS,
     `${namespacePath(config, namespaceId)}/keys?${query.toString()}`,
   );
   const payload = await readCloudflareJson(response);
@@ -237,8 +248,8 @@ async function readValue(url, config) {
   const metadataPath = `${namespacePath(config, namespaceId)}/metadata/${encodeKeyPathSegment(key)}`;
 
   const [valueResponse, metadataResponse] = await Promise.all([
-    cloudflareFetch(config, valuePath),
-    cloudflareFetch(config, metadataPath),
+    cloudflareFetch(config, CLOUDFLARE_API_OPERATIONS.READ_VALUE, valuePath),
+    cloudflareFetch(config, CLOUDFLARE_API_OPERATIONS.READ_METADATA, metadataPath),
   ]);
   await ensureCloudflareSuccess(valueResponse);
   const metadataPayload = await readCloudflareJson(metadataResponse);
@@ -314,7 +325,7 @@ async function writeValue(request, config) {
     endpoint.searchParams.set("expiration", String(existingAttributes.expiration));
   }
 
-  const response = await cloudflareFetch(config, endpoint, {
+  const response = await cloudflareFetch(config, CLOUDFLARE_API_OPERATIONS.WRITE_VALUE, endpoint, {
     method: "PUT",
     body: formData,
   });
@@ -334,6 +345,7 @@ async function readExistingAttributes(config, namespaceId, key) {
   const basePath = namespacePath(config, namespaceId);
   const valueResponse = await cloudflareFetch(
     config,
+    CLOUDFLARE_API_OPERATIONS.CHECK_EXISTING_VALUE,
     `${basePath}/values/${encodedKey}`,
   );
 
@@ -348,6 +360,7 @@ async function readExistingAttributes(config, namespaceId, key) {
 
   const metadataResponse = await cloudflareFetch(
     config,
+    CLOUDFLARE_API_OPERATIONS.CHECK_EXISTING_METADATA,
     `${basePath}/metadata/${encodedKey}`,
   );
   const metadataPayload = await readCloudflareJson(metadataResponse);
@@ -515,7 +528,7 @@ function getCookie(cookieHeader, name) {
   return null;
 }
 
-async function cloudflareFetch(config, pathOrUrl, init = {}) {
+async function cloudflareFetch(config, operation, pathOrUrl, init = {}) {
   const url =
     pathOrUrl instanceof URL
       ? pathOrUrl
@@ -525,8 +538,70 @@ async function cloudflareFetch(config, pathOrUrl, init = {}) {
 
   try {
     return await fetch(url, { ...init, headers, redirect: "error" });
-  } catch {
+  } catch (error) {
+    logCloudflareFetchFailure(operation, init.method, error);
     throw new HttpError(502, "无法连接 Cloudflare API。");
+  }
+}
+
+function logCloudflareFetchFailure(operation, method, error) {
+  const diagnostic = JSON.stringify({
+    event: "cloudflare_api_fetch_rejected",
+    operation,
+    method: method === "PUT" ? "PUT" : "GET",
+    error_category: cloudflareFetchErrorCategory(error),
+  });
+
+  try {
+    // Keep this log fully static: never send the original error, URL, headers,
+    // request body, or configuration into Workers Logs.
+    console.error(diagnostic);
+  } catch {
+    // Logging failure must not replace the original, generic 502 response.
+  }
+}
+
+function cloudflareFetchErrorCategory(error) {
+  const message = errorProperty(error, "message").toLowerCase();
+  if (message.includes("network connection lost")) {
+    return "network_connection_lost";
+  }
+  if (message.includes("cloudflare-owned") || /\b1024\b/u.test(message)) {
+    return "cloudflare_owned_ip";
+  }
+  if (message.includes("redirect")) {
+    return "redirect_rejected";
+  }
+  if (message.includes("dns")) {
+    return "dns_failure";
+  }
+  if (message.includes("tls") || message.includes("certificate")) {
+    return "tls_failure";
+  }
+
+  if (error instanceof TypeError) {
+    return "type_error";
+  }
+
+  const name = errorProperty(error, "name");
+  if (name === "AbortError") {
+    return "abort_error";
+  }
+  if (name === "TimeoutError") {
+    return "timeout_error";
+  }
+  return "unknown_error";
+}
+
+function errorProperty(error, property) {
+  try {
+    if (!error || (typeof error !== "object" && typeof error !== "function")) {
+      return "";
+    }
+    const value = error[property];
+    return typeof value === "string" ? value : "";
+  } catch {
+    return "";
   }
 }
 
